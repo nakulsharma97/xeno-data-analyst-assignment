@@ -3,6 +3,28 @@
 Finance reported a `target_base` of **22** for merchant 501, Diwali campaigns in October 2026.
 I needed to reproduce this number from the raw data and explain the adjustments.
 
+## What Counts as a Qualifying Send?
+
+Based strictly on the provided README, schema, data dictionary, and actual data, a send qualifies for `target_base` if and only if:
+
+- **Merchant eligibility**: The communication belongs to merchant 501 (`merchant_id = 501`).
+- **Diwali campaign eligibility**: The communication is of type 2 (`communication_type = '2'`), which in this dataset corresponds to Diwali campaigns. (No explicit campaign-type column exists; this is the available proxy.)
+- **October 2026 date scope**: The communication was sent in October 2026 (`sent_time >= '2026-10-01' AND sent_time < '2026-11-01'`).
+- **Campaign status / approval state**: The parent campaign must be in a finalized state (`creation_status IN ('approved', 'aborted', 'resumed', 'stopped')`) and processed (`processing_status = 'processed'`). Sends from campaigns awaiting approval (`approval_awaiting`) are not reportable per the data dictionary.
+- **Communication-log records**: Each row in `communication_log` represents a send attempt.
+- **Delivery status**: Only successful deliveries count (`delivery_status = 900`). Failed attempts (`delivery_status = 1100`) are excluded, even if later retried and delivered.
+- **Failed sends**: A failed attempt is not a qualifying send; only the eventual successful delivery in a retry chain may count (subject to chain deduplication rules below).
+- **Retry / parent-child communication chains**: Sends can be retried, forming a parent-child chain via `campaign.parent_id`. Within a chain, multiple attempts for the same customer represent a single underlying communication opportunity. Therefore, we deduplicate by customer *within each chain* to avoid overcounting retries.
+- **Multiple legitimate sends to the same customer**: 
+  - Within a single retry chain, only one successful send per customer counts (after deduplication).
+  - For standalone campaigns (no retries), each delivered send counts separately, even if the same customer receives multiple sends in different standalone campaigns. Example: Customer C20 received two standalone sends under campaign 9101 (Oct 10 and Oct 20); both are real, separate sends.
+- **Why `COUNT(DISTINCT customer_id)` is not automatically correct**: A global distinct-customer count incorrectly merges sends from different chains or standalone campaigns for the same customer. The correct rule is to deduplicate only within a retry chain, not across the whole merchant. In this dataset, a global distinct count yields 21 (incorrect) because it merges C20's two standalone sends.
+
+This definition directly informs the SQL logic: filters for merchant, date, communication type, campaign status, processing status, and delivery status; then the recursive CTE groups campaigns by retry chain; finally, we count one send per distinct customer per chain (for chains with ≥2 campaigns) and every send individually for standalone chains (single-campaign chains).
+
+### Why a recursive CTE?
+Communication attempts can form parent-child retry chains. The recursive CTE traverses these chains so that related attempts can be evaluated together rather than treating every log row as an independent send. A simple `COUNT(*)` can be misleading when retry/parent-child communication records exist because it would count every retry attempt separately, overcounting the true number of underlying communication opportunities. The chain-aware query correctly collapses retries within a chain while preserving distinct sends from standalone campaigns.
+
 ## 1. Reconciliation bridge
 
 I started with the most obvious query and then applied adjustments based on the data dictionary and business rules.
@@ -43,6 +65,9 @@ or run the verification script to see the full bridge:
 ```bash
 python scripts/verify_reconciliation.py
 ```
+
+### Why a recursive CTE? (Expanded)
+As noted in the qualifying sends section, communication attempts can form parent-child retry chains. The recursive CTE is essential to traverse these chains so that related attempts are evaluated together. Without it, each log row would be treated as an independent send, leading to overcount when retries exist. The CTE groups campaigns by their chain's root, enabling within-chain deduplication of customers while preserving counts for standalone campaigns.
 
 ## 3. What surprised me
 
