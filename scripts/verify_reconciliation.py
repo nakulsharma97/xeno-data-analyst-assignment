@@ -134,8 +134,29 @@ def main():
     cur = conn.cursor()
 
     bridge = run_bridge(cur)
-    final_results = run_final_queries(cur)
+    # Assert each bridge step
+    assert bridge["0_naive_scoped"] == 30, (
+        f"Expected 30 at step0 (naive scoped), got {bridge['0_naive_scoped']}"
+    )
+    assert bridge["1_eligible_campaigns"] == 26, (
+        f"Expected 26 at step1 (eligible campaigns), got {bridge['1_eligible_campaigns']}"
+    )
+    assert bridge["2_delivered_only"] == 22, (
+        f"Expected 22 at step2 (delivered only), got {bridge['2_delivered_only']}"
+    )
+    assert bridge["trap_global_distinct_customer"] == 21, (
+        f"Expected 21 for distinct customer (trap), got {bridge['trap_global_distinct_customer']}"
+    )
 
+    final_results = run_final_queries(cur)
+    assert final_results[0] == 22, (
+        f"Query 1 (row-count) expected 22, got {final_results[0]}"
+    )
+    assert final_results[1] == 22, (
+        f"Query 2 (retry-chain-aware) expected 22, got {final_results[1]}"
+    )
+
+    # Now print the bridge as before
     print("=" * 78)
     print("RECONCILIATION BRIDGE")
     print("=" * 78)
@@ -152,13 +173,6 @@ def main():
     if len(final_results) > 1:
         print(f"Query 2 (retry-chain-aware) -> target_base = {final_results[1]}")
     print("=" * 78)
-
-    assert bridge["2_delivered_only"] == 22, (
-        f"Expected 22 after bridge steps, got {bridge['2_delivered_only']}"
-    )
-    assert final_results[0] == 22, f"Query 1 expected 22, got {final_results[0]}"
-    if len(final_results) > 1:
-        assert final_results[1] == 22, f"Query 2 expected 22, got {final_results[1]}"
 
     print("SUCCESS: target_base = 22 reproduced and verified via both queries.")
     conn.close()

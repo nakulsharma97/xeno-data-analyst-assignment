@@ -4,6 +4,7 @@
 -- Finance's reported target_base: 22
 -- =============================================================================
 
+-- See Query 2 below for the version that remains correct even if a future dataset has a customer delivered twice within one retry chain.
 -- =============================================================================
 -- QUERY 1 — Row-count / operational
 -- Filters to eligible campaigns + delivered sends, counts rows directly.
@@ -64,7 +65,7 @@ delivered AS (
         l.customer_id,
         cs.n_campaigns
     FROM communication_log l
-    JOIN eligible e   ON e.campaign_id = l.communication_id
+    JOIN eligible e ON e.campaign_id = l.communication_id
     JOIN chain_size cs ON cs.root_id = e.root_id
     WHERE l.merchant_id = 501
       AND l.communication_type = '2'
