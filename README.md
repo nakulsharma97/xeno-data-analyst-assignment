@@ -18,27 +18,26 @@ The following ER diagram illustrates the schema and relationships:
 
 ```mermaid
 erDiagram
-    CAMPAIGN ||..o{ CAMPAIGN : parent-child (retry chains)
-    CAMPAIGN ||..o{ COMMUNICATION_LOG : contains
+    CAMPAIGN ||--o{ CAMPAIGN : "parent-child retry chains"
+    CAMPAIGN ||--o{ COMMUNICATION_LOG : contains
+
     CAMPAIGN {
         int id PK
         int merchant_id
         int parent_id FK
         varchar name
-        varchar creation_status
-        varchar processing_status
+        date start_date
+        date end_date
+        int communication_type
+        varchar status
     }
+
     COMMUNICATION_LOG {
         int id PK
-        int merchant_id
-        int communication_id FK
-        varchar customer_id
-        int communication_type
-        int delivery_status
-        datetime sent_time
-        int credit_used
-        varchar channel
-        datetime scheduled_time
+        int campaign_id FK
+        int customer_id
+        varchar status
+        datetime sent_at
     }
 ```
 
