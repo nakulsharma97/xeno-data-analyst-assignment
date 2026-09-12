@@ -1,20 +1,24 @@
 # Comm-Log Send Reconciliation — Merchant 501, Diwali Campaigns, October 2026
 
-## Project Overview
-This project reconciles the reported `target_base` of 22 qualifying sends for merchant 501 during October 2026 Diwali campaigns. A naive count of communication log rows yields 30 sends. The discrepancy arises from ineligible campaigns, failed deliveries, and retry chain deduplication rules. The goal is to apply business rules from the data dictionary to arrive at the correct qualifying send count.
+## Summary
 
-## Business Question
-For merchant 501 in October 2026, how many qualifying sends occurred under Diwali campaigns (communication_type = '2'), after applying eligibility filters and correctly handling retry chains?
+Finance reports `target_base = 22` qualifying sends for merchant 501 during October 2026 Diwali campaigns. A naive count of communication log rows yields 30 sends. Two real adjustments close the gap: (1) excluding sends from campaign 9004, which is still `approval_awaiting` and not reportable, and (2) excluding soft-failure rows (`delivery_status = 1100`) that were retried elsewhere. The final query in `sql/reconciliation_query.sql` reproduces 22 using a recursive CTE for retry-chain-aware deduplication.
 
-## Dataset
+**Verify independently:** Run `python scripts/verify_reconciliation.py` to see the full reconciliation bridge and confirm the number is correct.
+
+## Problem
+
+For merchant 501 in October 2026, how many qualifying sends occurred under Diwali campaigns (`communication_type = '2'`), after applying eligibility filters and correctly handling retry chains?
+
+## Data
+
 The project includes two raw CSV files and one SQLite database:
 
-- **`data/campaign.csv`**: Campaign metadata including `id`, `merchant_id`, `parent_id` (for retry chains), `name`, `creation_status`, `processing_status`.
-- **`data/communication_log.csv`**: Each row represents a send attempt with fields: `id`, `merchant_id`, `communication_id` (links to campaign), `customer_id`, `communication_type` (2 = Diwali), `delivery_status` (900 = success, 1100 = soft failure), `sent_time`.
-- **`data/comm_log.db`**: SQLite database containing the above tables for querying.
+- **`data/campaign.csv`** — Campaign metadata: `id`, `merchant_id`, `parent_id` (for retry chains), `name`, `creation_status`, `processing_status`.
+- **`data/communication_log.csv`** — One row per send attempt: `id`, `merchant_id`, `communication_id` (links to campaign), `customer_id`, `communication_type` (2 = Diwali), `delivery_status` (900 = success, 1100 = soft failure), `sent_time`.
+- **`data/comm_log.db`** — SQLite database containing the above tables for querying.
 
 ### Entity-Relationship Diagram
-The following ER diagram illustrates the schema and relationships:
 
 ```mermaid
 erDiagram
@@ -42,59 +46,63 @@ erDiagram
 ```
 
 ## Investigation Process
-We began with the most obvious query and refined it using the data dictionary and observed data:
 
-1. **Naive scoped count**: All rows for merchant 501, communication_type='2', and October 2026 → 30 sends.
-2. **Add campaign eligibility**: Exclude campaigns not in a finalized state (`creation_status` not in `approved`, `aborted`, `resumed`, `stopped`) → 26 sends (removed 4 rows from campaign 9004, which was `approval_awaiting`).
-3. **Add delivery success**: Keep only `delivery_status = 900` → 22 sends (removed 4 soft failures). This matches Finance's number.
-4. **Check for over‑counting**: A global `COUNT(DISTINCT customer_id)` yields 21, which is incorrect because it merges two separate standalone sends to customer C20 (from campaign 9101 on Oct 10 and Oct 20). The correct rule is to deduplicate only within a retry chain, not across the entire merchant.
-5. **Validate retry chains**: No customer received more than one successful delivery within the same retry chain in this dataset, so the row‑count and chain‑aware queries agree. However, the chain‑aware query is the correct generalization.
+We began with the most obvious query and refined it step by step:
+
+1. **Naive scoped count** — All rows for merchant 501, `communication_type='2'`, October 2026 → **30** sends.
+2. **Add campaign eligibility** — Join to `campaign` and keep only finalized campaigns (`creation_status` in `approved`, `aborted`, `resumed`, `stopped`). Drops **4** rows from campaign 9004 (`approval_awaiting`): **26** sends.
+3. **Add delivery success** — Keep only `delivery_status = 900`. Drops **4** soft-failure rows (C2 and C3 in 9001/9002, D1 in 9201): **22** sends. Matches Finance's number.
+4. **Check for over-counting** — A global `COUNT(DISTINCT customer_id)` yields 21, which is incorrect: it merges two separate standalone sends to customer C20 (campaign 9101, Oct 10 and Oct 20). The correct rule is to deduplicate only within a retry chain, not across the merchant.
+5. **Validate retry chains** — No customer received more than one successful delivery within the same retry chain in this dataset, so the row-count and chain-aware queries agree. The chain-aware query is the correct generalization.
 
 ## Reconciliation Bridge
-The table below shows each step of the reconciliation, with values derived directly from the data.
 
 | Step | Description | Result | Reason |
 |------|-------------|--------|--------|
-| 0 | Naive `COUNT(*)` on `communication_log`, scoped to merchant 501 / Oct 2026 / `communication_type='2'` | 30 | The baseline is scoped to merchant 501, October 2026, and communication type `2`. |
-| 1 | Join to `campaign` and keep only finalized campaigns (`creation_status` in `approved`, `aborted`, `resumed`, `stopped`) | 26 | Campaign 9004 (`Diwali Cart Recovery - Retry C (pending)`) has `creation_status = approval_awaiting`. Although its messages were delivered, the data dictionary states that sends from campaigns awaiting approval are not reportable. Dropped 4 rows (one per customer C11–C14). |
-| 2 | Keep only `delivery_status = 900` (successful delivery) | 22 | Four rows had `delivery_status = 1100` (soft failures): C2 and C3 in campaign 9001, C3 in 9002, and D1 in 9201. Each of these was retried and eventually delivered elsewhere in the chain. A failed attempt is not a qualifying send. This brought the count to 22, matching Finance's number. |
-| Trap | Global `COUNT(DISTINCT customer_id)` (incorrect) | 21 | Incorrectly merges C20's two standalone sends under campaign 9101 (Oct 10 and Oct 20). The correct rule is to deduplicate only within a retry chain, not across the whole merchant. |
+| 0 | Naive `COUNT(*)`, scoped to merchant 501 / Oct 2026 / `communication_type='2'` | 30 | Baseline scoped to merchant 501, October 2026, and communication type `2`. |
+| 1 | Join to `campaign`, keep only finalized campaigns | 26 | Campaign 9004 (`approval_awaiting`) is not reportable. Dropped 4 rows (C11–C14). |
+| 2 | Keep only `delivery_status = 900` | 22 | Four soft failures (`delivery_status = 1100`) dropped. Matches Finance. |
+| Trap | Global `COUNT(DISTINCT customer_id)` | 21 | Incorrectly merges C20's two standalone sends under campaign 9101. |
 
 ## Final SQL
-The final, correct query is located at `sql/reconciliation_query.sql`. It uses a recursive CTE to traverse retry chains, then:
-- For chains with 2+ campaigns (a retry chain): counts one qualifying send per distinct customer per chain.
-- For chains with exactly 1 campaign (a standalone send): counts every delivered send individually.
-This approach correctly handles duplicate customers across different chains and avoids over‑counting retries within a chain.
 
-**Key features:**
-- No hardcoding of 22; the result is derived from the data.
-- Preserves correctness even if a future dataset has a customer delivered twice within the same retry chain.
-- Includes comments explaining the business logic at each stage.
+The query is at `sql/reconciliation_query.sql`. It uses a recursive CTE to traverse retry chains:
+
+- **Retry chains (2+ campaigns):** counts one qualifying send per distinct customer per chain.
+- **Standalone campaigns (1 campaign):** counts every delivered send individually.
+
+This handles duplicate customers across different chains and avoids over-counting retries within a chain. No hardcoding — the result is derived from the data.
+
+## Surprising Observations
+
+- Campaign 9004 had fully delivered messages despite never clearing approval. The log alone cannot tell you a send is disqualified; you must check the campaign lifecycle state.
+- The `communication_type = '2'` filter was redundant in this dataset (every campaign for merchant 501 is Diwali-themed), but is retained for correctness in a real-world query.
+- The row-count and chain-aware queries agree only because no customer was delivered twice within the same retry chain. The chain-aware query is retained as the correct generalization.
 
 ## How to Run
-Run the final query directly with SQLite:
+
+**Final query:**
 ```bash
 sqlite3 data/comm_log.db < sql/reconciliation_query.sql
 ```
-or execute the verification script to see the full bridge:
+
+**Verification script (prints the full bridge and confirms 22):**
 ```bash
 python scripts/verify_reconciliation.py
 ```
 
-## Project Structure
+## Repository Structure
+
 ```
 .
-├── README.md          # This file
-├── .gitignore         # Git ignore rules (adjusted to track deliverable DB)
-│
+├── README.md
+├── .gitignore
 ├── data/
 │   ├── campaign.csv          # Campaign metadata
 │   ├── communication_log.csv # Raw communication log
-│   └── comm_log.db           # SQLite database (queried directly)
-│
+│   └── comm_log.db           # SQLite database
 ├── sql/
-│   └── reconciliation_query.sql # Correct, chain‑aware query that calculates target_base
-│
+│   └── reconciliation_query.sql  # Final chain-aware query
 └── scripts/
-    └── verify_reconciliation.py # Verification script that prints the bridge and confirms the query returns 22
+    └── verify_reconciliation.py  # Verification script
 ```
