@@ -125,6 +125,7 @@ cython_debug
 *.db-journal
 *.db-wal
 *.db-shm
+!data/comm_log.db
 
 # OS
 .DS_Store
