@@ -120,6 +120,9 @@ dmypy.json
 # Cython debug symbols
 cython_debug
 
+# Editor / agent metadata
+.freebuff/
+
 # SQLite
 *.db
 *.db-journal

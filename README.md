@@ -62,7 +62,7 @@ The table below shows each step of the reconciliation, with values derived direc
 | Trap | Global `COUNT(DISTINCT customer_id)` (incorrect) | 21 | Incorrectly merges C20's two standalone sends under campaign 9101 (Oct 10 and Oct 20). The correct rule is to deduplicate only within a retry chain, not across the whole merchant. |
 
 ## Final SQL
-The final, correct query is located at `sql/final_reconciliation.sql`. It uses a recursive CTE to traverse retry chains, then:
+The final, correct query is located at `sql/reconciliation_query.sql`. It uses a recursive CTE to traverse retry chains, then:
 - For chains with 2+ campaigns (a retry chain): counts one qualifying send per distinct customer per chain.
 - For chains with exactly 1 campaign (a standalone send): counts every delivered send individually.
 This approach correctly handles duplicate customers across different chains and avoids over‑counting retries within a chain.
@@ -80,7 +80,7 @@ This approach correctly handles duplicate customers across different chains and 
 ## How to Run
 Run the final query directly with SQLite:
 ```bash
-sqlite3 data/comm_log.db < sql/final_reconciliation.sql
+sqlite3 data/comm_log.db < sql/reconciliation_query.sql
 ```
 or execute the verification script to see the full bridge:
 ```bash
@@ -99,9 +99,8 @@ python scripts/verify_reconciliation.py
 │   └── comm_log.db           # SQLite database (queried directly)
 │
 ├── sql/
-│   ├── exploration.sql       # Useful investigative queries (schema, counts, statuses, chains)
-│   └── final_reconciliation.sql # Correct, chain‑aware query that calculates target_base
+│   └── reconciliation_query.sql # Correct, chain‑aware query that calculates target_base
 │
 └── scripts/
-    └── verify_reconciliation.py # Verification script that prints the bridge and confirms both queries return 22
+    └── verify_reconciliation.py # Verification script that prints the bridge and confirms the query returns 22
 ```
