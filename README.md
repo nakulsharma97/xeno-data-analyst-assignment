@@ -7,11 +7,11 @@ This project reconciles the reported `target_base` of 22 qualifying sends for me
 For merchant 501 in October 2026, how many qualifying sends occurred under Diwali campaigns (communication_type = '2'), after applying eligibility filters and correctly handling retry chains?
 
 ## Dataset
-The project uses three data files:
+The project includes two raw CSV files and one SQLite database:
 
-- **`campaign.csv`**: Campaign metadata including `id`, `merchant_id`, `parent_id` (for retry chains), `name`, `creation_status`, `processing_status`.
-- **`communication_log.csv`**: Each row represents a send attempt with fields: `id`, `merchant_id`, `communication_id` (links to campaign), `customer_id`, `communication_type` (2 = Diwali), `delivery_status` (900 = success, 1100 = soft failure), `sent_time`.
-- **`comm_log.db`**: SQLite database containing the above tables for querying.
+- **`data/campaign.csv`**: Campaign metadata including `id`, `merchant_id`, `parent_id` (for retry chains), `name`, `creation_status`, `processing_status`.
+- **`data/communication_log.csv`**: Each row represents a send attempt with fields: `id`, `merchant_id`, `communication_id` (links to campaign), `customer_id`, `communication_type` (2 = Diwali), `delivery_status` (900 = success, 1100 = soft failure), `sent_time`.
+- **`data/comm_log.db`**: SQLite database containing the above tables for querying.
 
 ### Entity-Relationship Diagram
 The following ER diagram illustrates the schema and relationships:
@@ -56,7 +56,7 @@ The table below shows each step of the reconciliation, with values derived direc
 
 | Step | Description | Result | Reason |
 |------|-------------|--------|--------|
-| 0 | Naive `COUNT(*)` on `communication_log`, scoped to merchant 501 / Oct 2026 / `communication_type='2'` | 30 | Starting point — all rows in the log already belong to merchant 501 and are Diwali‑themed (as seen in the campaign data), so no extra filters were needed for this baseline. |
+| 0 | Naive `COUNT(*)` on `communication_log`, scoped to merchant 501 / Oct 2026 / `communication_type='2'` | 30 | The baseline is scoped to merchant 501, October 2026, and communication type `2`. |
 | 1 | Join to `campaign` and keep only finalized campaigns (`creation_status` in `approved`, `aborted`, `resumed`, `stopped`) | 26 | Campaign 9004 (`Diwali Cart Recovery - Retry C (pending)`) has `creation_status = approval_awaiting`. Although its messages were delivered, the data dictionary states that sends from campaigns awaiting approval are not reportable. Dropped 4 rows (one per customer C11–C14). |
 | 2 | Keep only `delivery_status = 900` (successful delivery) | 22 | Four rows had `delivery_status = 1100` (soft failures): C2 and C3 in campaign 9001, C3 in 9002, and D1 in 9201. Each of these was retried and eventually delivered elsewhere in the chain. A failed attempt is not a qualifying send. This brought the count to 22, matching Finance's number. |
 | Trap | Global `COUNT(DISTINCT customer_id)` (incorrect) | 21 | Incorrectly merges C20's two standalone sends under campaign 9101 (Oct 10 and Oct 20). The correct rule is to deduplicate only within a retry chain, not across the whole merchant. |
@@ -71,11 +71,6 @@ This approach correctly handles duplicate customers across different chains and 
 - No hardcoding of 22; the result is derived from the data.
 - Preserves correctness even if a future dataset has a customer delivered twice within the same retry chain.
 - Includes comments explaining the business logic at each stage.
-
-## Surprising Observations
-- Campaign 9004 had fully delivered messages despite never clearing approval (`approval_awaiting`). This reveals a real‑world operational gap between "message sent" and "message reportable"—the log alone cannot tell you a send is disqualified; you must check the campaign lifecycle state.
-- The Diwali campaign filter (`communication_type = '2'`) was redundant in this specific dataset because every campaign for merchant 501 in the data is Diwali‑themed. However, the filter is retained because a real‑world query would need it.
-- The row‑count and chain‑aware queries agree only by luck: in this dataset, no customer was delivered more than once within the same retry chain, so the simpler query happened to be correct. The chain‑aware query is retained as the robust solution.
 
 ## How to Run
 Run the final query directly with SQLite:
