@@ -1,9 +1,12 @@
--- Final reconciliation query for Xeno Data Analyst Assignment
--- Calculates target_base for Merchant 501, Diwali campaigns (type=2), October 2026.
--- Correctly handles retry chains: within a chain, deduplicate by customer; 
--- standalone campaigns count each delivered send separately.
--- This query remains correct even if a customer is delivered more than once
--- within the same retry chain (unlike a simple row-count approach).
+-- Reconciliation query for Xeno Data Analyst Assignment (SQLite).
+-- target_base for Merchant 501, Diwali campaigns (type='2'), October 2026.
+--
+-- Rule: one qualifying send per customer per retry chain (2+ campaigns linked
+-- by parent_id). Standalone campaigns (1 campaign) count every delivered send
+-- individually, including repeat sends to the same customer (e.g. C20 in 9101).
+--
+-- A naive delivered-row count also gives 22 here because no customer got two
+-- deliveries within the same chain, but this query is the correct general case.
 
 WITH RECURSIVE chain(campaign_id, root_id) AS (
     -- Anchor: root campaigns (not a retry of anything)
@@ -19,7 +22,7 @@ WITH RECURSIVE chain(campaign_id, root_id) AS (
     JOIN chain ch ON c.parent_id = ch.campaign_id
 ),
 eligible AS (
-    -- Campaigns that are finalized and processed (per data dictionary)
+    -- Campaigns that are finalized (creation_status approved, aborted, etc.)
     SELECT c.id AS campaign_id, ch.root_id
     FROM campaign c
     JOIN chain ch ON ch.campaign_id = c.id
@@ -48,9 +51,11 @@ delivered AS (
       AND l.sent_time <  '2026-11-01'
       AND l.delivery_status = 900
 )
--- Final aggregation:
--- For retry chains (2+ campaigns): count distinct customer per chain (one send per customer per chain)
--- For standalone campaigns (1 campaign): count each send_id (each send is a distinct opportunity)
+-- Aggregation:
+-- * Chains (>1 campaign): count distinct (root_id, customer_id) pairs — one
+--   qualifying send per customer per chain.
+-- * Standalones (=1 campaign): count every send_id — repeat sends to the
+--   same customer both count (e.g. C20 in 9101).
 SELECT
     COUNT(DISTINCT CASE WHEN n_campaigns > 1 THEN root_id || '-' || customer_id END)
   + COUNT(CASE WHEN n_campaigns = 1 THEN send_id END)
