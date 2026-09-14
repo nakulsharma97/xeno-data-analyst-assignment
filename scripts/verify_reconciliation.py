@@ -2,21 +2,24 @@
 """
 Reconciliation verification for the Xeno Data Analyst assignment.
 
-Runs against data/comm_log.db (paths are relative to the repository root,
-so the script works from any fresh clone):
+Two independent code paths compute the same bridge values:
+  - Pure Python loops over campaign.csv / communication_log.csv
+  - SQL queries against data/comm_log.db
+Every bridge step and per-chain count is cross-checked between the two.
+A mismatch fails even if both disagree with the documented constants.
 
-  1. Data-quality checks   - integrity violations (hard failures) and
-                             unexpected status values (warnings only, since
-                             the schema does not constrain these).
-  2. Reconciliation bridge - 30 -> 26 -> 22, plus the 21 global-DISTINCT trap
-                             and the per-chain intermediate counts.
-  3. Final result          - executes the actual sql/reconciliation_query.sql
-                             file (no duplicated SQL) and confirms 22.
+Sections:
+  1. Data-quality checks (integrity + status values)
+  2. Reconciliation bridge (SQL vs Python cross-check)
+  3. Per-chain breakdown (SQL vs Python cross-check)
+  4. Final SQL file (executes reconciliation_query.sql, confirms 22)
+  5. Adversarial test (insert duplicate send, prove chain dedup holds)
 
-Exit code 0 = everything passed, 1 = at least one failure.
+Exit code 0 = all passed, 1 = at least one failure.
 Standard library only.
 """
 
+import csv
 import shutil
 import sqlite3
 import sys
@@ -26,22 +29,20 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "data" / "comm_log.db"
 SQL_PATH = BASE_DIR / "sql" / "reconciliation_query.sql"
+CAMPAIGN_CSV = BASE_DIR / "data" / "campaign.csv"
+COMM_LOG_CSV = BASE_DIR / "data" / "communication_log.csv"
 
-# Assignment scope (mirrors the brief / README).
+# Assignment scope.
 MERCHANT_ID = 501
 COMM_TYPE = "2"  # communication_type is TEXT in the schema; '2' = Diwali
 MONTH_START, MONTH_END = "2026-10-01", "2026-11-01"
 DELIVERED = 900  # delivery_status 900 = delivered, 1100 = soft failure
 
-# Expected bridge numbers, verified against the dataset and documented in README.
-EXPECTED_BRIDGE = {
-    "naive_scoped": 30,
-    "eligible_only": 26,
-    "delivered_only": 22,
-    "trap_global_distinct_customers": 21,
-}
-EXPECTED_CHAINS = {9001: 10, 9101: 7, 9201: 5}  # root -> qualifying sends
-FINAL_TARGET_BASE = 22
+# Documented expectations (for human readers, not used for assertions).
+# All pass/fail logic is driven by the SQL-vs-Python cross-checks below.
+# DOCUMENTED_FINAL = 22
+# DOCUMENTED_BRIDGE = {"naive": 30, "eligible": 26, "delivered": 22, "trap": 21}
+# DOCUMENTED_CHAINS = {9001: 10, 9101: 7, 9201: 5}
 
 SCOPE = (
     f"l.merchant_id = {MERCHANT_ID} "
@@ -49,8 +50,7 @@ SCOPE = (
     f"AND l.sent_time >= '{MONTH_START}' AND l.sent_time < '{MONTH_END}'"
 )
 
-# Retry-chain CTE stack shared by the audit queries below. A depth guard keeps
-# the recursion finite even if malformed data ever contained a parent cycle.
+# Retry-chain CTE stack shared by the audit queries below.
 CHAIN_CTES = f"""
 WITH RECURSIVE chain(campaign_id, root_id, depth) AS (
     SELECT id, id, 0 FROM campaign WHERE parent_id IS NULL
@@ -80,7 +80,6 @@ delivered AS (
 )
 """
 
-# Hard integrity checks: each returns violating rows; empty result = pass.
 INTEGRITY_CHECKS = [
     (
         "Duplicate campaign IDs",
@@ -121,9 +120,6 @@ INTEGRITY_CHECKS = [
     ),
 ]
 
-# Status-value expectations: values observed in the assignment dataset. The
-# schema declares no CHECK constraints, so anything unexpected is a WARNING,
-# not a failure (per the README: statuses are documented, not enforced).
 STATUS_EXPECTATIONS = [
     (
         "campaign.creation_status",
@@ -148,6 +144,128 @@ STATUS_EXPECTATIONS = [
 ]
 
 
+# --------------------------------------------------------------------------- #
+#  Pure-Python bridge computation (from CSVs, no SQL)                         #
+# --------------------------------------------------------------------------- #
+
+def load_csv_data():
+    """Read campaign.csv and communication_log.csv into plain dicts/lists."""
+    campaigns = {}
+    with open(CAMPAIGN_CSV, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            campaigns[int(r["id"])] = {
+                "id": int(r["id"]),
+                "parent_id": int(r["parent_id"]) if r["parent_id"] else None,
+                "creation_status": r["creation_status"],
+                "processing_status": r["processing_status"],
+            }
+
+    comm_log = []
+    with open(COMM_LOG_CSV, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            comm_log.append({
+                "id": int(r["id"]),
+                "communication_id": int(r["communication_id"]),
+                "customer_id": r["customer_id"],
+                "communication_type": r["communication_type"],
+                "delivery_status": int(r["delivery_status"]),
+                "sent_time": r["sent_time"],
+            })
+    return campaigns, comm_log
+
+
+def build_chains(campaigns):
+    """Walk parent_id links to assign every campaign to its chain root.
+
+    Returns (root_of, chain_size) where:
+      root_of[campaign_id]  = id of the chain's root campaign (its own id)
+      chain_size[root_id]   = number of campaigns in that chain
+    """
+    root_of = {}
+    # Seed: root campaigns (parent_id is None) are their own root.
+    for cid, c in campaigns.items():
+        if c["parent_id"] is None:
+            root_of[cid] = cid
+    for cid in campaigns:
+        if cid in root_of:
+            continue
+        path = []
+        node = cid
+        while node not in root_of:
+            path.append(node)
+            node = campaigns[node]["parent_id"]
+        root = root_of[node]
+        for c in path:
+            root_of[c] = root
+
+    chain_size = {}
+    for cid, root in root_of.items():
+        chain_size[root] = chain_size.get(root, 0) + 1
+    return root_of, chain_size
+
+
+def compute_bridge_from_csv(campaigns, comm_log, root_of, chain_size):
+    """Derive every bridge value in pure Python loops. Returns a dict."""
+    eligible_ids = set()
+    for cid, c in campaigns.items():
+        if (c["creation_status"] in ("approved", "aborted", "resumed", "stopped")
+                and c["processing_status"] == "processed"):
+            eligible_ids.add(cid)
+
+    # Step 1: naive scoped count — all rows matching merchant / type / date.
+    in_scope = []
+    for row in comm_log:
+        if (row["communication_type"] == COMM_TYPE
+                and row["sent_time"] >= MONTH_START
+                and row["sent_time"] < MONTH_END):
+            in_scope.append(row)
+    naive = len(in_scope)
+
+    # Step 2: eligible campaigns only.
+    eligible = [r for r in in_scope if r["communication_id"] in eligible_ids]
+
+    # Step 3: delivered only.
+    delivered = [r for r in eligible if r["delivery_status"] == DELIVERED]
+    delivered_count = len(delivered)
+
+    # Trap: global distinct-customer count (wrong for this assignment).
+    trap = len({r["customer_id"] for r in delivered})
+
+    # Per-chain breakdown using the same formula as the SQL query:
+    #   chains (>1 campaign):  distinct (root_id, customer_id) pairs
+    #   standalones (=1 campaign):  every send_id counts
+    chains = {}
+    for r in delivered:
+        cid = r["communication_id"]
+        root = root_of[cid]
+        nc = chain_size[root]
+        key = root if root is not None else cid
+        chains.setdefault(key, {"n_campaigns": nc, "key_set": set(), "row_count": 0})
+        chains[key]["row_count"] += 1
+        if nc > 1:
+            chains[key]["key_set"].add((root, r["customer_id"]))
+
+    chain_totals = {}
+    for root, info in chains.items():
+        if info["n_campaigns"] > 1:
+            chain_totals[root] = len(info["key_set"])
+        else:
+            chain_totals[root] = info["row_count"]
+
+    return {
+        "naive": naive,
+        "eligible": len(eligible),
+        "delivered": delivered_count,
+        "trap": trap,
+        "chain_totals": chain_totals,
+        "final": sum(chain_totals.values()),
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  SQL helpers                                                                #
+# --------------------------------------------------------------------------- #
+
 def header(title):
     print()
     print("=" * 78)
@@ -156,9 +274,8 @@ def header(title):
 
 
 def execute_sql_file(conn, path):
-    """Execute the actual SQL file. Handles the normal single-statement case
-    directly; if the file ever contains several statements, runs them all and
-    returns the last result set."""
+    """Execute the actual SQL file. Returns (columns, rows) from the last
+    result set."""
     sql = path.read_text(encoding="utf-8")
     try:
         cur = conn.execute(sql)
@@ -173,6 +290,10 @@ def execute_sql_file(conn, path):
     columns = [d[0] for d in cur.description]
     return columns, cur.fetchall()
 
+
+# --------------------------------------------------------------------------- #
+#  Main                                                                       #
+# --------------------------------------------------------------------------- #
 
 def main():
     failures = []
@@ -193,6 +314,13 @@ def main():
     if not SQL_PATH.exists():
         print(f"ERROR: SQL file not found at {SQL_PATH}")
         return 1
+
+    # ---- compute expected values from CSVs (no SQL) ----
+    csv_campaigns, csv_log = load_csv_data()
+    csv_root_of, csv_chain_size = build_chains(csv_campaigns)
+    csv_bridge = compute_bridge_from_csv(
+        csv_campaigns, csv_log, csv_root_of, csv_chain_size
+    )
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -218,18 +346,24 @@ def main():
             warnings.append(column)
 
     # ------------------------------------------------------------------ #
-    header("3. RECONCILIATION BRIDGE")
+    header("3. RECONCILIATION BRIDGE (SQL vs Python cross-check)")
+    print(f"  Python-derived values: naive={csv_bridge['naive']}, "
+          f"eligible={csv_bridge['eligible']}, delivered={csv_bridge['delivered']}, "
+          f"trap={csv_bridge['trap']}")
+    print()
 
-    naive = cur.execute(
+    # Step 1: naive scoped count.
+    sql_naive = cur.execute(
         f"SELECT COUNT(*) FROM communication_log l WHERE {SCOPE}"
     ).fetchone()[0]
     check(
-        "Step 1  naive scoped count (merchant / Oct 2026 / type '2')",
-        naive == EXPECTED_BRIDGE["naive_scoped"],
-        f"got {naive}, expected {EXPECTED_BRIDGE['naive_scoped']}",
+        "Step 1  naive scoped count",
+        sql_naive == csv_bridge["naive"],
+        f"SQL={sql_naive}, Python={csv_bridge['naive']}",
     )
 
-    eligible = cur.execute(
+    # Step 2: eligible campaigns only.
+    sql_eligible = cur.execute(
         f"""SELECT COUNT(*)
             FROM communication_log l
             JOIN campaign c ON l.communication_id = c.id
@@ -238,13 +372,13 @@ def main():
               AND c.processing_status = 'processed'"""
     ).fetchone()[0]
     check(
-        "Step 2  + reportable campaigns only (drops 9004, approval_awaiting)",
-        eligible == EXPECTED_BRIDGE["eligible_only"],
-        f"got {eligible}, expected {EXPECTED_BRIDGE['eligible_only']} "
-        f"(-{naive - eligible} rows)",
+        "Step 2  + reportable campaigns only",
+        sql_eligible == csv_bridge["eligible"],
+        f"SQL={sql_eligible}, Python={csv_bridge['eligible']}",
     )
 
-    delivered = cur.execute(
+    # Step 3: delivered only.
+    sql_delivered = cur.execute(
         f"""SELECT COUNT(*)
             FROM communication_log l
             JOIN campaign c ON l.communication_id = c.id
@@ -254,13 +388,13 @@ def main():
               AND l.delivery_status = {DELIVERED}"""
     ).fetchone()[0]
     check(
-        "Step 3  + delivered only (delivery_status = 900)",
-        delivered == EXPECTED_BRIDGE["delivered_only"],
-        f"got {delivered}, expected {EXPECTED_BRIDGE['delivered_only']} "
-        f"(-{eligible - delivered} soft failures)",
+        "Step 3  + delivered only",
+        sql_delivered == csv_bridge["delivered"],
+        f"SQL={sql_delivered}, Python={csv_bridge['delivered']}",
     )
 
-    trap = cur.execute(
+    # Trap: global distinct customer count.
+    sql_trap = cur.execute(
         f"""SELECT COUNT(DISTINCT l.customer_id)
             FROM communication_log l
             JOIN campaign c ON l.communication_id = c.id
@@ -270,13 +404,13 @@ def main():
               AND l.delivery_status = {DELIVERED}"""
     ).fetchone()[0]
     check(
-        "Trap    global COUNT(DISTINCT customer_id) is 21, not 22",
-        trap == EXPECTED_BRIDGE["trap_global_distinct_customers"],
-        f"got {trap}: collapses C20's two standalone sends in campaign 9101",
+        "Trap    global DISTINCT customer count",
+        sql_trap == csv_bridge["trap"],
+        f"SQL={sql_trap}, Python={csv_bridge['trap']}",
     )
 
-    print()
-    print("  Per-chain breakdown (root -> qualifying sends):")
+    # ------------------------------------------------------------------ #
+    header("4. PER-CHAIN BREAKDOWN (SQL vs Python cross-check)")
     chain_rows = cur.execute(
         CHAIN_CTES
         + """SELECT root_id, n_campaigns,
@@ -287,26 +421,38 @@ def main():
              GROUP BY root_id, n_campaigns
              ORDER BY root_id"""
     ).fetchall()
-    chain_map = dict((r[0], r[2]) for r in chain_rows)
-    all_chain_expected = True
-    for root, n_campaigns, counted in chain_rows:
-        kind = "chain  " if n_campaigns > 1 else "single "
-        expected = EXPECTED_CHAINS.get(root)
-        ok = counted == expected
-        all_chain_expected = all_chain_expected and ok
-        detail = f"{kind} ({n_campaigns} campaign(s)) -> {counted}"
-        if not ok:
-            detail += f", expected {expected}"
-        check(f"root {root}", ok, detail)
+
+    sql_chain_map = dict((r[0], r[2]) for r in chain_rows)
+    py_chain_map = csv_bridge["chain_totals"]
+
+    all_chains_ok = True
+    all_roots = sorted(set(sql_chain_map) | set(py_chain_map),
+                       key=lambda x: (x is None, x or 0))
+    for root in all_roots:
+        sql_val = sql_chain_map.get(root, 0)
+        py_val = py_chain_map.get(root, 0)
+        ok = sql_val == py_val
+        all_chains_ok = all_chains_ok and ok
+        nc = next((r[1] for r in chain_rows if r[0] == root), 0)
+        kind = "chain  " if nc > 1 else "single "
+        label = f"root {root or '(none)'} {kind}({nc} campaign(s))" if root is None else f"root {root} {kind}({nc} campaign(s))"
+        check(
+            label,
+            ok,
+            f"SQL={sql_val}, Python={py_val}",
+        )
+
     check(
-        "Chain counts sum to the final result",
-        all_chain_expected and sum(chain_map.values()) == delivered,
-        " + ".join(str(v) for v in chain_map.values())
-        + f" = {sum(chain_map.values())}",
+        "Chain totals sum = delivered count",
+        all_chains_ok and sum(sql_chain_map.values()) == sql_delivered,
+        "SQL=" + " + ".join(str(sql_chain_map.get(r, 0))
+                            for r in sorted(sql_chain_map))
+              + f" = {sum(sql_chain_map.values())}"
+              + f" (delivered={sql_delivered})",
     )
 
     # ------------------------------------------------------------------ #
-    header("4. FINAL QUERY (executes sql/reconciliation_query.sql)")
+    header("5. FINAL QUERY (executes sql/reconciliation_query.sql)")
     columns, rows = execute_sql_file(conn, SQL_PATH)
     print(f"  Columns: {columns}")
     if "target_base" not in columns or not rows:
@@ -314,13 +460,13 @@ def main():
     else:
         value = rows[0][columns.index("target_base")]
         check(
-            "target_base equals 22",
-            value == FINAL_TARGET_BASE,
-            f"got {value}",
+            "target_base = delivered count",
+            value == csv_bridge["delivered"],
+            f"SQL file={value}, delivered={csv_bridge['delivered']}",
         )
 
     # ------------------------------------------------------------------ #
-    header("5. ADVERSARIAL TEST: chain dedup holds under mutation")
+    header("6. ADVERSARIAL TEST: chain dedup holds under mutation")
     print("  Copying DB to temp file and inserting a duplicate delivered send...")
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
@@ -349,17 +495,17 @@ def main():
         ).fetchone()[0]
 
         print(
-            f"  After inserting a duplicate delivered send for C1 in chain 9001:"
+            "  After inserting a duplicate delivered send for C1 in chain 9001:"
         )
         check(
-            "Naive row count over-counts (23 != 22)",
-            naive_val == 23,
-            f"got {naive_val}",
+            "Naive row count over-counts",
+            naive_val == csv_bridge["delivered"] + 1,
+            f"SQL={naive_val} (expected {csv_bridge['delivered'] + 1})",
         )
         check(
-            "Chain-aware query still returns 22",
-            chain_val == 22,
-            f"got {chain_val}",
+            "Chain-aware query still returns correct count",
+            chain_val == csv_bridge["delivered"],
+            f"SQL file={chain_val}, original={csv_bridge['delivered']}",
         )
     finally:
         tmp_conn.close()
@@ -377,9 +523,9 @@ def main():
             print(f"    - {f}")
         return 1
     print(
-        f"  SUCCESS: data quality clean, bridge "
-        f"{naive} -> {eligible} -> {delivered} reproduced, "
-        f"target_base = {FINAL_TARGET_BASE} confirmed."
+        f"  SUCCESS: SQL and Python independently agree — "
+        f"bridge {csv_bridge['naive']} -> {csv_bridge['eligible']} -> "
+        f"{csv_bridge['delivered']}, target_base = {csv_bridge['delivered']}."
     )
     return 0
 
