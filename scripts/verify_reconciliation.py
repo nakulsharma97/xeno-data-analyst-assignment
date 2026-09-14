@@ -8,6 +8,14 @@ Two independent code paths compute the same bridge values:
 Every bridge step and per-chain count is cross-checked between the two.
 A mismatch fails even if both disagree with the documented constants.
 
+The SQL and Python paths are independently implemented, but they encode the
+same business-rule assumptions (same eligible-status list, same month scope,
+same delivery-status definition, same standalone-vs-chain counting rule). If
+a business-rule assumption itself is wrong, both paths will agree and still be
+wrong -- the cross-check catches implementation bugs, not business-logic
+misinterpretations. That has to be validated separately against the assignment's
+intended definition, not by this script.
+
 Sections:
   1. Data-quality checks (integrity + status values)
   2. Reconciliation bridge (SQL vs Python cross-check)
@@ -165,6 +173,7 @@ def load_csv_data():
         for r in csv.DictReader(f):
             comm_log.append({
                 "id": int(r["id"]),
+                "merchant_id": r["merchant_id"],
                 "communication_id": int(r["communication_id"]),
                 "customer_id": r["customer_id"],
                 "communication_type": r["communication_type"],
@@ -215,7 +224,8 @@ def compute_bridge_from_csv(campaigns, comm_log, root_of, chain_size):
     # Step 1: naive scoped count — all rows matching merchant / type / date.
     in_scope = []
     for row in comm_log:
-        if (row["communication_type"] == COMM_TYPE
+        if (row["merchant_id"] == str(MERCHANT_ID)
+                and row["communication_type"] == COMM_TYPE
                 and row["sent_time"] >= MONTH_START
                 and row["sent_time"] < MONTH_END):
             in_scope.append(row)
@@ -467,6 +477,11 @@ def main():
 
     # ------------------------------------------------------------------ #
     header("6. ADVERSARIAL TEST: chain dedup holds under mutation")
+    print("  Scope: proves chain-level dedup handles a duplicate delivered send")
+    print("  within a single chain. Does not cover: duplicate sends within a")
+    print("  standalone campaign, customers across different chains, multi-level")
+    print("  retry depth beyond current data, cyclic parents, or eligibility edges.")
+    print()
     print("  Copying DB to temp file and inserting a duplicate delivered send...")
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()

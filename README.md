@@ -1,6 +1,20 @@
-# Comm-Log Send Reconciliation — Merchant 501, Diwali Campaigns, October 2026
+# Xeno Data Analyst Assignment
 
-## Summary
+## Final Answer
+
+`target_base = 22`
+
+## Reconciliation Bridge
+
+30 → 26 → 22
+
+## Key Finding
+
+`COUNT(DISTINCT customer_id)` gives 21, not 22, because customer C20 has two delivered sends under standalone campaign 9101 — both count individually, but a global DISTINCT collapses them.
+
+---
+
+## Full Analysis
 
 Finance reports `target_base = 22` qualifying sends for merchant 501 during October 2026 Diwali campaigns. A naive count of the communication log is 30 sends. Two adjustments bring it to 22: (1) excluding 4 sends from campaign 9004, which is still `approval_awaiting` and not reportable, and (2) excluding 4 soft-failure rows (`delivery_status = 1100`), each of which was retried and delivered within its own chain. The query at `sql/reconciliation_query.sql` gets 22 using a recursive CTE that deduplicates per chain, not globally.
 
@@ -86,7 +100,13 @@ erDiagram
 
 ### Why `COUNT(DISTINCT customer_id)` gives 21, not 22
 
-Running `COUNT(DISTINCT customer_id)` on the 22 delivered sends gives **21**. Customer **C20** received two delivered sends under standalone campaign 9101 (send IDs 18 and 19 — Oct 10 and Oct 20). Global `DISTINCT` counts C20 once, but standalone campaigns count each delivered send individually. The correct deduplication is per retry chain, not per merchant.
+Running `COUNT(DISTINCT customer_id)` on the 22 delivered sends gives **21**. Customer **C20** received two delivered sends under **standalone** campaign 9101 (send IDs 18 and 19 — Oct 10 and Oct 20). Global `DISTINCT` counts C20 once, but standalone campaigns count each delivered send individually. The correct deduplication is per retry chain, not per merchant.
+
+## Business Rule Justification
+
+The eligibility filter uses `creation_status IN ('approved', 'aborted', 'resumed', 'stopped') AND processing_status = 'processed'`. This is an interpretation of the assignment's intent, not a rule the data itself proves.
+
+A campaign in `approval_awaiting` never cleared review — its sends shouldn't count toward Finance's number. The remaining statuses represent campaigns that reached a finalized state in their lifecycle (approved, aborted after starting, resumed, or stopped mid-run), all with sends that were actually processed. We can't derive this purely by trial and error to match 22; if we included `approval_awaiting`, the count would be 26, which disagrees with Finance. The filter is therefore a principled reading of the data dictionary's intent, cross-checked against the expected result.
 
 ## Final SQL
 

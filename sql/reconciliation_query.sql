@@ -8,18 +8,19 @@
 -- A naive delivered-row count also gives 22 here because no customer got two
 -- deliveries within the same chain, but this query is the correct general case.
 
-WITH RECURSIVE chain(campaign_id, root_id) AS (
+WITH RECURSIVE chain(campaign_id, root_id, depth) AS (
     -- Anchor: root campaigns (not a retry of anything)
-    SELECT id, id
+    SELECT id, id, 0
     FROM campaign
     WHERE parent_id IS NULL
 
     UNION ALL
 
     -- Recursive step: attach each retry to its chain's root
-    SELECT c.id, ch.root_id
+    SELECT c.id, ch.root_id, ch.depth + 1
     FROM campaign c
     JOIN chain ch ON c.parent_id = ch.campaign_id
+    WHERE ch.depth < 50  -- defensive against malformed cyclic parent_id graphs
 ),
 eligible AS (
     -- Campaigns that are finalized (creation_status approved, aborted, etc.)
