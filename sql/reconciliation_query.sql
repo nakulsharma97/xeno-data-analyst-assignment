@@ -5,8 +5,11 @@
 -- by parent_id). Standalone campaigns (1 campaign) count every delivered send
 -- individually, including repeat sends to the same customer (e.g. C20 in 9101).
 --
--- A naive delivered-row count also gives 22 here because no customer got two
--- deliveries within the same chain, but this query is the correct general case.
+-- For this dataset, a naive delivered-row count (no chain dedup) also gives 22,
+-- because no customer got two deliveries within the same chain.
+-- Note: this is different from COUNT(DISTINCT customer_id), which gives 21 —
+-- see README for why that's wrong (standalone campaign 9101 sends to C20 twice).
+-- This query is the correct general case regardless of which naive count matches.
 
 WITH RECURSIVE chain(campaign_id, root_id, depth) AS (
     -- Anchor: root campaigns (not a retry of anything)
