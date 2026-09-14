@@ -123,13 +123,17 @@ The query only hardcodes the scope filters (merchant 501, October 2026, type `'2
 - **Every soft failure was retried successfully.** The 4 `delivery_status = 1100` rows (C2@9001, C3@9001, C3@9002, D1@9201) each have a later delivered retry in the same chain.
 - **The scope filters don't change anything here.** All 30 rows are merchant 501, type `'2'`, inside October 2026, and `sent_time = scheduled_time` for every row. They're kept because the assignment defines the scope.
 
-## How to Run
+## Verification
 
 ```bash
 python scripts/verify_reconciliation.py
 ```
 
-Or directly with `sqlite3`:
+The script independently implements the same business rules in Python (over CSVs) and SQL (over SQLite), then cross-checks every bridge step and per-chain count between the two. It catches implementation bugs where the two paths disagree.
+
+It does **not** validate that the business-rule assumptions themselves are correct — that requires comparing against the assignment's intended definitions, not just internal consistency.
+
+Or run the SQL directly:
 
 ```bash
 sqlite3 data/comm_log.db < sql/reconciliation_query.sql

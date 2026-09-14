@@ -199,8 +199,15 @@ def build_chains(campaigns):
         if cid in root_of:
             continue
         path = []
+        visited = set()
         node = cid
         while node not in root_of:
+            if node in visited:
+                raise ValueError(
+                    f"Cycle detected in campaign parent_id graph at {node} "
+                    f"(chain: {' -> '.join(str(n) for n in path)} -> {node})"
+                )
+            visited.add(node)
             path.append(node)
             node = campaigns[node]["parent_id"]
         root = root_of[node]
